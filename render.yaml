@@ -1,0 +1,9 @@
+﻿services:
+  - type: web
+    name: taeon-v2-api
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
