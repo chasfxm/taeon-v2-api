@@ -9,6 +9,36 @@ const PORT = Number(process.env.PORT || 3215);
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
+const SUPABASE_URL =
+    process.env.SUPABASE_URL || "";
+
+const SUPABASE_KEY =
+    process.env.SUPABASE_KEY || "";
+
+const TAEON_DB_TOKEN =
+    process.env.TAEON_DB_TOKEN || "";
+
+const USE_SUPABASE =
+    Boolean(
+        SUPABASE_URL &&
+        SUPABASE_KEY &&
+        TAEON_DB_TOKEN
+    );
+
+const REMOTE_COLLECTIONS = [
+    "events",
+    "documents",
+    "history",
+    "expenses",
+    "staged"
+];
+
+const remoteCache =
+    new Map();
+
+let persistQueue =
+    Promise.resolve();
+
 const HISTORY_FILE =
     path.join(DATA_DIR, "history.json");
 
@@ -67,7 +97,275 @@ function ensureJsonFile(filePath) {
 );
 
 
+function collectionForFile(
+    filePath
+) {
+
+    const collection =
+        path.basename(
+            filePath,
+            ".json"
+        );
+
+    return REMOTE_COLLECTIONS.includes(
+        collection
+    )
+        ? collection
+        : null;
+}
+
+
+function cloneArray(value) {
+
+    return JSON.parse(
+        JSON.stringify(
+            Array.isArray(value)
+                ? value
+                : []
+        )
+    );
+}
+
+
+async function supabaseRpc(
+    rpcName,
+    payload
+) {
+
+    const response =
+        await fetch(
+            SUPABASE_URL +
+            "/rest/v1/rpc/" +
+            rpcName,
+            {
+                method:
+                    "POST",
+
+                headers: {
+                    apikey:
+                        SUPABASE_KEY,
+
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify(
+                        payload
+                    )
+            }
+        );
+
+
+    const responseText =
+        await response.text();
+
+
+    if (!response.ok) {
+
+        throw new Error(
+            "SUPABASE " +
+            response.status +
+            " : " +
+            responseText
+        );
+    }
+
+
+    if (!responseText) {
+        return null;
+    }
+
+
+    return JSON.parse(
+        responseText
+    );
+}
+
+
+async function loadRemoteStore() {
+
+    if (!USE_SUPABASE) {
+
+        console.log(
+            "[TAEON V2 STORAGE] LOCAL JSON"
+        );
+
+        return;
+    }
+
+
+    const rows =
+        await supabaseRpc(
+            "taeon_store_get",
+            {
+                p_secret:
+                    TAEON_DB_TOKEN
+            }
+        );
+
+
+    for (
+        const collection
+        of REMOTE_COLLECTIONS
+    ) {
+
+        remoteCache.set(
+            collection,
+            []
+        );
+    }
+
+
+    for (
+        const row
+        of (rows || [])
+    ) {
+
+        if (
+            !REMOTE_COLLECTIONS.includes(
+                row.collection
+            )
+        ) {
+            continue;
+        }
+
+
+        const value =
+            Array.isArray(
+                row.payload
+            )
+                ? row.payload
+                : [];
+
+
+        remoteCache.set(
+            row.collection,
+            value
+        );
+
+
+        const localFile =
+            path.join(
+                DATA_DIR,
+                row.collection +
+                ".json"
+            );
+
+
+        fs.writeFileSync(
+            localFile,
+            JSON.stringify(
+                value,
+                null,
+                2
+            ),
+            "utf8"
+        );
+    }
+
+
+    console.log(
+        "[TAEON V2 STORAGE] SUPABASE READY"
+    );
+}
+
+
+async function persistCollection(
+    collection,
+    data
+) {
+
+    if (
+        !USE_SUPABASE ||
+        !collection
+    ) {
+        return;
+    }
+
+
+    await supabaseRpc(
+        "taeon_store_put",
+        {
+            p_secret:
+                TAEON_DB_TOKEN,
+
+            p_collection:
+                collection,
+
+            p_payload:
+                cloneArray(
+                    data
+                )
+        }
+    );
+}
+
+
+function queuePersist(
+    collection,
+    data
+) {
+
+    if (
+        !USE_SUPABASE ||
+        !collection
+    ) {
+
+        return;
+    }
+
+
+    const snapshot =
+        cloneArray(
+            data
+        );
+
+
+    remoteCache.set(
+        collection,
+        snapshot
+    );
+
+
+    persistQueue =
+        persistQueue
+            .catch(
+                () => {}
+            )
+            .then(
+                () =>
+                    persistCollection(
+                        collection,
+                        snapshot
+                    )
+            );
+}
+
+
 function readJson(filePath) {
+
+    const collection =
+        collectionForFile(
+            filePath
+        );
+
+
+    if (
+        USE_SUPABASE &&
+        collection &&
+        remoteCache.has(
+            collection
+        )
+    ) {
+
+        return cloneArray(
+            remoteCache.get(
+                collection
+            )
+        );
+    }
+
 
     try {
 
@@ -103,6 +401,14 @@ function writeJson(
             2
         ),
         "utf8"
+    );
+
+
+    queuePersist(
+        collectionForFile(
+            filePath
+        ),
+        data
     );
 }
 
@@ -189,17 +495,93 @@ function sendJson(
     payload
 ) {
 
-    res.writeHead(
-        status,
-        corsHeaders(req)
-    );
+    const finish =
+        (
+            finalStatus,
+            finalPayload
+        ) => {
 
-    res.end(
-        JSON.stringify(
-            payload,
-            null,
-            2
-        )
+            if (res.headersSent) {
+                return;
+            }
+
+
+            res.writeHead(
+                finalStatus,
+                corsHeaders(req)
+            );
+
+
+            res.end(
+                JSON.stringify(
+                    finalPayload,
+                    null,
+                    2
+                )
+            );
+        };
+
+
+    const mutation =
+        req.method === "POST" ||
+        req.method === "PATCH";
+
+
+    if (
+        USE_SUPABASE &&
+        mutation
+    ) {
+
+        const currentQueue =
+            persistQueue;
+
+
+        currentQueue
+            .then(
+                () => {
+
+                    finish(
+                        status,
+                        payload
+                    );
+                }
+            )
+            .catch(
+                error => {
+
+                    console.error(
+                        "[TAEON DB SAVE ERROR]",
+                        error.message
+                    );
+
+
+                    finish(
+                        500,
+                        {
+                            ok:
+                                false,
+
+                            status:
+                                "FAIL",
+
+                            message:
+                                "영구저장 실패",
+
+                            detail:
+                                error.message
+                        }
+                    );
+                }
+            );
+
+
+        return;
+    }
+
+
+    finish(
+        status,
+        payload
     );
 }
 
@@ -1183,7 +1565,7 @@ const server =
                             "TAEON V2 WEB API",
 
                         version:
-                            "2.0.0",
+                            "2.1.0",
 
                         status:
                             "RUNNING",
@@ -1221,12 +1603,17 @@ const server =
                             "TAEON V2 WEB API",
 
                         version:
-                            "2.0.0",
+                            "2.1.0",
 
                         environment:
                             process.env.RENDER
                                 ? "RENDER"
                                 : "LOCAL",
+
+                        storage:
+                            USE_SUPABASE
+                                ? "SUPABASE"
+                                : "LOCAL_JSON",
 
                         endpoints: {
 
@@ -2534,41 +2921,66 @@ const server =
     );
 
 
-server.listen(
-    PORT,
-    HOST,
-    () => {
+async function startServer() {
 
-        console.log(
-            `[TAEON V2 API V2] RUNNING http://${HOST}:${PORT}`
+    try {
+
+        await loadRemoteStore();
+
+    } catch (error) {
+
+        console.error(
+            "[TAEON V2 STORAGE INIT ERROR]",
+            error.message
         );
 
-        console.log(
-            "[TAEON V2 API V2] /api/health"
-        );
 
-        console.log(
-            "[TAEON V2 API V2] /api/events"
-        );
-
-        console.log(
-            "[TAEON V2 API V2] /api/documents/register"
-        );
-
-        console.log(
-            "[TAEON V2 API V2] /api/intake/preview"
-        );
-
-        console.log(
-            "[TAEON V2 API V2] /api/intake/apply"
-        );
-
-        console.log(
-            "[TAEON V2 API V2] /api/followups"
-        );
-
-        console.log(
-            "[TAEON V2 API V2] /api/journal/daily"
+        console.error(
+            "[TAEON V2 STORAGE] LOCAL JSON FALLBACK"
         );
     }
-);
+
+
+    server.listen(
+        PORT,
+        HOST,
+        () => {
+
+            console.log(
+                "[TAEON V2 API V2.1] RUNNING"
+            );
+
+
+            console.log(
+                "[TAEON V2 STORAGE] " +
+                (
+                    USE_SUPABASE
+                        ? "SUPABASE"
+                        : "LOCAL_JSON"
+                )
+            );
+
+
+            console.log(
+                "[TAEON V2 API V2.1] http://" +
+                HOST +
+                ":" +
+                PORT
+            );
+        }
+    );
+}
+
+
+startServer()
+    .catch(
+        error => {
+
+            console.error(
+                "[TAEON V2 START ERROR]",
+                error
+            );
+
+            process.exit(1);
+        }
+    );
